@@ -8,7 +8,7 @@ gettext-rs = { version = "~0.7", features = ["gettext-system"] }
 gtk = { version = "~0.11", package = "gtk4", features = ["gnome_46"] }
 once_cell = "~1.21"
 qrcode-generator = "~5.0"
-ncm-api = { git = "https://github.com/arkuna23/netease-cloud-music-api.git", rev = "04a2aac55c00c1b355a49b89a2a4e1abb5d73b4d", package = "netease-cloud-music-api" }
+ncm-api = { git = "https://github.com/arkuna23/netease-cloud-music-api.git", rev = "c995ae509dcf0bec2c04e096bad0bd5a30bda4d1", package = "netease-cloud-music-api" }
 anyhow = "~1.0"
 gstreamer = "~0.25"
 gstreamer-play = "~0.25"
