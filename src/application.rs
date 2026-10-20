@@ -18,10 +18,12 @@ use std::{
     time::Duration,
 };
 
+use crate::audio::scrobble::{EndReason, PlaybackObservation};
 use crate::{
     MAINCONTEXT, NeteaseCloudMusicGtk4Window, audio::MprisController, config::VERSION,
     gui::NeteaseCloudMusicGtk4Preferences, model::*, ncmapi::*, path::CACHE, utils::*,
 };
+use std::time::{Instant, SystemTime};
 
 // implements Debug for Fn(Targ) using "blanket implementations"
 pub trait ActionCallbackTr<TArg>: Fn(TArg) + Sync + Send {}
@@ -106,14 +108,14 @@ pub enum Action {
     HeartbeatExtend(SongInfo, HeartbeatExtendMode),
 
     // play
-    AddPlay(SongInfo),
+    AddPlay(SongInfo, ncm_api::PlaybackSource),
     PlayNextSong,
     PlayPreviousSong,
     Play(SongInfo),
-    PlayStart(SongInfo),
+    PlayStart(u64, SongInfo, ncm_api::PlaybackSource),
     TogglePlayPause,
     // (歌单, 是否立即播放)
-    AddPlayList(Vec<SongInfo>, bool),
+    AddPlayList(Vec<SongInfo>, bool, ncm_api::PlaybackSource),
     PlayListStart,
     PersistVolume(f64),
     GetSongUrl(SongInfo),
@@ -175,6 +177,9 @@ pub enum Action {
     PageBack,
 
     // gst
+    PlaybackObserved(u64, PlaybackObservation, Instant),
+    PlaybackFinished(u64, EndReason),
+    PlayLoadFailed(u64),
     GstDurationChanged(u64),
     GstStateChanged(gstreamer_play::PlayState),
     GstVolumeChanged(f64),
@@ -205,6 +210,11 @@ mod imp {
         pub receiver: RefCell<Option<Receiver<Action>>>,
         pub unikey: Arc<RwLock<String>>,
         pub ncmapi: RefCell<Option<NcmClient>>,
+        pub scrobbler: crate::audio::scrobble::Scrobbler,
+        pub play_generation: std::cell::Cell<u64>,
+        pub media_generation: std::cell::Cell<u64>,
+        pub quitting: std::cell::Cell<bool>,
+        pub login_generation: std::cell::Cell<u64>,
     }
 
     #[glib::object_subclass]
@@ -225,6 +235,11 @@ mod imp {
                 receiver,
                 unikey,
                 ncmapi,
+                scrobbler: Default::default(),
+                play_generation: Default::default(),
+                media_generation: Default::default(),
+                quitting: Default::default(),
+                login_generation: Default::default(),
             }
         }
     }
@@ -261,6 +276,15 @@ mod imp {
             let window = app.create_window();
             let _ = self.window.set(window.downgrade());
 
+            let scrobbler = self.scrobbler.clone();
+            scrobbler.set_enabled(window.settings().boolean("sync-listening-history"));
+            MAINCONTEXT.spawn_local(scrobbler.clone().run());
+            window.settings().connect_changed(
+                Some("sync-listening-history"),
+                move |settings, _| {
+                    scrobbler.set_enabled(settings.boolean("sync-listening-history"));
+                },
+            );
             // Setup action channel
             let receiver = self.receiver.borrow_mut().take().unwrap();
             MAINCONTEXT.spawn_local_with_priority(
@@ -308,12 +332,40 @@ impl NeteaseCloudMusicGtk4Application {
     }
 
     pub fn graceful_quit(&self) {
-        if let Some(window) = self.imp().window.get().and_then(WeakRef::upgrade) {
+        let imp = self.imp();
+        if imp.quitting.replace(true) {
+            return;
+        }
+        self.capture_scrobble_position();
+        imp.scrobbler.shutdown();
+        if let Some(window) = imp.window.get().and_then(WeakRef::upgrade) {
             window.imp().graceful_quitting.set(true);
             window.imp().player_controls.save_current_state();
+            window.imp().player_controls.stop_for_quit();
             window.imp().tray_handle.borrow_mut().stop();
         }
-        self.quit();
+        let app = self.clone();
+        let scrobbler = imp.scrobbler.clone();
+        MAINCONTEXT.spawn_local(async move {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !scrobbler.is_idle() && Instant::now() < deadline {
+                timeout_future(Duration::from_millis(25)).await;
+            }
+            app.quit();
+        });
+    }
+
+    fn capture_scrobble_position(&self) {
+        let imp = self.imp();
+        if let Some(window) = imp.window.get().and_then(WeakRef::upgrade) {
+            if let Some(position) = window.imp().player_controls.playback_position() {
+                imp.scrobbler.observe(
+                    imp.media_generation.get(),
+                    PlaybackObservation::Position(position),
+                    Instant::now(),
+                );
+            }
+        }
     }
 
     fn init_ncmapi(&self, cli: NcmClient) -> NcmClient {
@@ -332,11 +384,18 @@ impl NeteaseCloudMusicGtk4Application {
             self.graceful_quit();
             return glib::ControlFlow::Continue;
         }
-        if self.active_window().is_none() {
+        if imp.quitting.get() {
             return glib::ControlFlow::Continue;
         }
-
-        let window = imp.window.get().unwrap().upgrade().unwrap();
+        if let Action::PlaybackObserved(generation, observation, at) = &action {
+            if *generation == imp.media_generation.get() {
+                imp.scrobbler.observe(*generation, observation.clone(), *at);
+            }
+            return glib::ControlFlow::Continue;
+        }
+        let Some(window) = imp.window.get().and_then(WeakRef::upgrade) else {
+            return glib::ControlFlow::Continue;
+        };
         let ncmapi = {
             let ncmapi_opt = { imp.ncmapi.borrow().as_ref().cloned() };
             if let Some(ncmapi) = ncmapi_opt {
@@ -350,18 +409,29 @@ impl NeteaseCloudMusicGtk4Application {
 
         match action {
             Action::CheckLogin(user_menu, logined_cookie_jar) => {
+                let login_generation = imp.login_generation.get() + 1;
+                imp.login_generation.set(login_generation);
                 let sender = imp.sender.clone();
                 let ncmapi = self.init_ncmapi(NcmClient::from_cookie_jar(logined_cookie_jar));
                 let s = self.clone();
 
                 MAINCONTEXT.spawn_local_with_priority(Priority::HIGH_IDLE, async move {
                     if !window.is_logined() {
-                        match ncmapi.client.login_status().await {
+                        let result = ncmapi.client.login_status().await;
+                        if s.imp().login_generation.get() != login_generation
+                            || s.imp().quitting.get()
+                        {
+                            return;
+                        }
+                        match result {
                             Ok(login_info) => {
                                 debug!("获取用户信息成功: {:?}", login_info);
                                 window.set_uid(login_info.uid);
 
                                 ncmapi.save_cookie_jar_to_file();
+                                s.imp()
+                                    .scrobbler
+                                    .set_account(ncmapi.client.clone(), login_info.uid);
                                 s.imp().ncmapi.replace(Some(ncmapi));
 
                                 sender
@@ -393,6 +463,9 @@ impl NeteaseCloudMusicGtk4Application {
                 });
             }
             Action::Logout => {
+                imp.login_generation.set(imp.login_generation.get() + 1);
+                self.capture_scrobble_position();
+                imp.scrobbler.logout();
                 let sender = imp.sender.clone();
                 let s = self.clone();
                 MAINCONTEXT.spawn_local_with_priority(Priority::DEFAULT_IDLE, async move {
@@ -695,7 +768,10 @@ impl NeteaseCloudMusicGtk4Application {
                                 Ok(songs) => {
                                     debug!("获取轮播歌曲信息：{:?}", songs);
                                     if let Some(song) = songs.first() {
-                                        sender.send(Action::AddPlay(song.clone())).await.unwrap();
+                                        sender
+                                            .send(Action::AddPlay(song.clone(), Default::default()))
+                                            .await
+                                            .unwrap();
                                     }
                                 }
                                 Err(err) => {
@@ -741,18 +817,55 @@ impl NeteaseCloudMusicGtk4Application {
                     TargetType::Unknown => (),
                 }
             }
-            Action::AddPlay(song_info) => {
-                window.add_play(song_info.clone());
+            Action::AddPlay(song_info, source) => {
+                window.add_play(song_info.clone(), source);
                 let sender = imp.sender.clone();
                 sender.send_blocking(Action::Play(song_info)).unwrap();
             }
+            Action::PlaybackObserved(..) => (),
+            Action::PlaybackFinished(generation, reason) => {
+                if generation == imp.media_generation.get() {
+                    self.capture_scrobble_position();
+                    imp.scrobbler.finish(generation, reason);
+                    if reason != EndReason::Stop {
+                        imp.media_generation.set(0);
+                    }
+                    if matches!(reason, EndReason::Eos | EndReason::Error) {
+                        imp.play_generation.set(imp.play_generation.get() + 1);
+                        window.play_next();
+                    }
+                }
+            }
+            Action::PlayLoadFailed(generation) => {
+                if generation == imp.play_generation.get() {
+                    self.capture_scrobble_position();
+                    imp.scrobbler
+                        .finish(imp.media_generation.get(), EndReason::Error);
+                    imp.media_generation.set(0);
+                    imp.play_generation.set(imp.play_generation.get() + 1);
+                    window.play_next();
+                }
+            }
             Action::PlayNextSong => {
+                self.capture_scrobble_position();
+                imp.scrobbler
+                    .finish(imp.media_generation.get(), EndReason::Change);
+                imp.media_generation.set(0);
+                imp.play_generation.set(imp.play_generation.get() + 1);
                 window.play_next();
             }
             Action::PlayPreviousSong => {
+                self.capture_scrobble_position();
+                imp.scrobbler
+                    .finish(imp.media_generation.get(), EndReason::Change);
+                imp.media_generation.set(0);
+                imp.play_generation.set(imp.play_generation.get() + 1);
                 window.play_prev();
             }
             Action::Play(song_info) => {
+                let generation = imp.play_generation.get() + 1;
+                imp.play_generation.set(generation);
+                let source = window.imp().player_controls.playback_source(song_info.id);
                 let sender = imp.sender.clone();
                 let music_rate = song_info
                     .quality
@@ -778,7 +891,10 @@ impl NeteaseCloudMusicGtk4Application {
                                     if song_info.quality.selected.is_none() {
                                         song_info.quality.selected = Some(song_url.quality);
                                     }
-                                    sender.send(Action::PlayStart(song_info)).await.unwrap();
+                                    sender
+                                        .send(Action::PlayStart(generation, song_info, source))
+                                        .await
+                                        .unwrap();
                                 } else {
                                     error!("获取歌曲播放链接失败: {:?}", &[song_info.id]);
                                     sender
@@ -789,7 +905,10 @@ impl NeteaseCloudMusicGtk4Application {
                                         .await
                                         .unwrap();
                                     timeout_future_seconds(2).await;
-                                    sender.send(Action::PlayNextSong).await.unwrap();
+                                    sender
+                                        .send(Action::PlayLoadFailed(generation))
+                                        .await
+                                        .unwrap();
                                 }
                             } else {
                                 error!("获取歌曲播放链接失败: {:?}", &[song_info.id]);
@@ -801,10 +920,16 @@ impl NeteaseCloudMusicGtk4Application {
                                     .await
                                     .unwrap();
                                 timeout_future_seconds(2).await;
-                                sender.send(Action::PlayNextSong).await.unwrap();
+                                sender
+                                    .send(Action::PlayLoadFailed(generation))
+                                    .await
+                                    .unwrap();
                             }
                         } else {
-                            sender.send(Action::PlayStart(song_info)).await.unwrap();
+                            sender
+                                .send(Action::PlayStart(generation, song_info, source))
+                                .await
+                                .unwrap();
                         }
                     });
                 } else {
@@ -812,10 +937,33 @@ impl NeteaseCloudMusicGtk4Application {
                         song_url: format!("file://{}", path.to_str().unwrap().to_owned()),
                         ..song_info
                     };
-                    sender.send_blocking(Action::PlayStart(song_info)).unwrap();
+                    sender
+                        .send_blocking(Action::PlayStart(generation, song_info, source))
+                        .unwrap();
                 }
             }
-            Action::PlayStart(song_info) => {
+            Action::PlayStart(generation, song_info, source) => {
+                if generation != imp.play_generation.get() {
+                    return glib::ControlFlow::Continue;
+                }
+                self.capture_scrobble_position();
+                let event = ncm_api::PlaybackEvent {
+                    session_id: 0,
+                    kind: ncm_api::PlaybackEventKind::Start,
+                    song_id: song_info.id,
+                    duration: Duration::from_millis(song_info.duration),
+                    played: Duration::ZERO,
+                    source,
+                    bitrate: 0,
+                    quality: song_info
+                        .quality
+                        .actual
+                        .map(|q| q.as_level().to_owned())
+                        .unwrap_or_default(),
+                    timestamp: SystemTime::now(),
+                };
+                imp.scrobbler.begin(generation, event);
+                imp.media_generation.set(generation);
                 // 启用桌面歌词
                 if window.settings().boolean("desktop-lyrics") {
                     let sender = imp.sender.clone();
@@ -837,7 +985,7 @@ impl NeteaseCloudMusicGtk4Application {
                     .send_blocking(Action::UpdateTrayPlaying(true))
                     .unwrap();
 
-                window.play(song_info);
+                window.play(song_info, generation);
             }
             Action::ToSongListPage(songlist) => {
                 let page = window.init_songlist_page(&songlist, false);
@@ -976,8 +1124,8 @@ impl NeteaseCloudMusicGtk4Application {
                     }
                 });
             }
-            Action::AddPlayList(sis, is_play) => {
-                window.add_playlist(sis, is_play);
+            Action::AddPlayList(sis, is_play, source) => {
+                window.add_playlist(sis, is_play, source);
             }
             Action::PlayListStart => {
                 window.playlist_start();
@@ -1116,7 +1264,18 @@ impl NeteaseCloudMusicGtk4Application {
                             window.set_heartbeat_active(true);
                             let mut pla = vec![si];
                             pla.append(&mut pl);
-                            sender.send(Action::AddPlayList(pla, false)).await.unwrap();
+                            sender
+                                .send(Action::AddPlayList(
+                                    pla,
+                                    false,
+                                    ncm_api::PlaybackSource {
+                                        id: playlist_id.to_string(),
+                                        kind: "list".into(),
+                                        name: "list".into(),
+                                    },
+                                ))
+                                .await
+                                .unwrap();
                             sender
                                 .send(Action::AddToast(gettext("Intelligent Mode")))
                                 .await
@@ -1670,4 +1829,39 @@ fn remove_all_file(path: PathBuf) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::NeteaseCloudMusicGtk4Application;
+    use gtk::{gio, prelude::*, subclass::prelude::*};
+
+    #[test]
+    #[ignore = "requires a display, built resources and GSETTINGS_SCHEMA_DIR"]
+    fn window_close_preserves_background_then_uses_graceful_quit() {
+        gtk::init().unwrap();
+        gstreamer::init().unwrap();
+        crate::path::init().unwrap();
+        let resource = gio::Resource::load(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("_build/data/netease-cloud-music-gtk4.gresource"),
+        )
+        .unwrap();
+        gio::resources_register(&resource);
+        let app = NeteaseCloudMusicGtk4Application::new(
+            "com.gitee.gmg137.NeteaseCloudMusicGtk4.ScrobbleTest",
+            &gio::ApplicationFlags::NON_UNIQUE,
+        );
+        app.register(None::<&gio::Cancellable>).unwrap();
+        app.activate();
+        let window = app.imp().window.get().unwrap().upgrade().unwrap();
+        window.set_hide_on_close(true);
+        window.close();
+        assert!(!app.imp().quitting.get());
+        window.set_hide_on_close(false);
+        window.present();
+        window.close();
+        assert!(app.imp().quitting.get());
+        assert!(window.imp().graceful_quitting.get());
+    }
 }

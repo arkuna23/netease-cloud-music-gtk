@@ -149,10 +149,16 @@ mod imp {
             // 窗口关闭时保存播放列表并清理系统托盘
             obj.connect_close_request(|window| {
                 if !window.imp().graceful_quitting.get() {
-                    window.imp().player_controls.save_current_state();
                     if !window.hides_on_close() {
-                        window.imp().tray_handle.borrow_mut().stop();
+                        if let Some(app) = window
+                            .application()
+                            .and_downcast::<crate::application::NeteaseCloudMusicGtk4Application>(
+                        ) {
+                            app.graceful_quit();
+                            return glib::Propagation::Stop;
+                        }
                     }
+                    window.imp().player_controls.save_current_state();
                 }
                 glib::Propagation::Proceed
             });
@@ -202,9 +208,11 @@ mod imp {
 
         fn signals() -> &'static [Signal] {
             static SIGNALS: Lazy<Vec<Signal>> = Lazy::new(|| {
-                vec![Signal::builder("current-song-changed")
-                    .param_types([u64::static_type()])
-                    .build()]
+                vec![
+                    Signal::builder("current-song-changed")
+                        .param_types([u64::static_type()])
+                        .build(),
+                ]
             });
             SIGNALS.as_ref()
         }
@@ -481,9 +489,9 @@ impl NeteaseCloudMusicGtk4Window {
         discover.setup_new_albums(song_list);
     }
 
-    pub fn add_play(&self, song_info: SongInfo) {
+    pub fn add_play(&self, song_info: SongInfo, source: ncm_api::PlaybackSource) {
         let player_controls = self.imp().player_controls.get();
-        player_controls.add_song(song_info);
+        player_controls.add_song(song_info, source);
     }
 
     pub fn remove_from_playlist(&self, song_info: SongInfo) {
@@ -491,7 +499,9 @@ impl NeteaseCloudMusicGtk4Window {
         player_controls.remove_song(song_info);
 
         let sis = player_controls.get_list();
-        let si = player_controls.get_current_song().unwrap_or(crate::utils::empty_song_info());
+        let si = player_controls
+            .get_current_song()
+            .unwrap_or(crate::utils::empty_song_info());
 
         self.init_playlist_lyrics_page(sis, si.to_owned());
 
@@ -505,9 +515,9 @@ impl NeteaseCloudMusicGtk4Window {
         }
     }
 
-    pub fn add_playlist(&self, sis: Vec<SongInfo>, is_play: bool) {
+    pub fn add_playlist(&self, sis: Vec<SongInfo>, is_play: bool, source: ncm_api::PlaybackSource) {
         let player_controls = self.imp().player_controls.get();
-        player_controls.add_list(sis);
+        player_controls.add_list(sis, source);
         let sender = self.imp().sender.get().unwrap();
         if is_play {
             sender.send_blocking(Action::PlayListStart).unwrap();
@@ -560,11 +570,11 @@ impl NeteaseCloudMusicGtk4Window {
         player_controls.next_song();
     }
 
-    pub fn play(&self, song_info: SongInfo) {
+    pub fn play(&self, song_info: SongInfo, generation: u64) {
         let id = song_info.id;
         let player_controls = self.imp().player_controls.get();
         player_controls.set_property("like", self.imp().user_like_song_contains(&id));
-        player_controls.play(song_info);
+        player_controls.play(song_info, generation);
         self.show_player_bar();
         self.imp().current_song_id.set(id);
         self.emit_by_name::<()>("current-song-changed", &[&id]);

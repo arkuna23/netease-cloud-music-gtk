@@ -278,7 +278,11 @@ impl SearchSongPage {
         if !self.imp().playlist.borrow().is_empty() {
             let playlist = &*self.imp().playlist.borrow();
             sender
-                .send_blocking(Action::AddPlayList(playlist.clone(), true))
+                .send_blocking(Action::AddPlayList(
+                    playlist.clone(),
+                    true,
+                    Default::default(),
+                ))
                 .unwrap();
         } else {
             sender

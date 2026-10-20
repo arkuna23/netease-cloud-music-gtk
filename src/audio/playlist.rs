@@ -30,6 +30,8 @@ pub(crate) struct PlayListData {
     pub position: usize,
     // 播放进度（微秒）
     pub play_position: u64,
+    #[serde(default)]
+    pub sources: std::collections::HashMap<u64, ncm_api::PlaybackSource>,
     // 当前播放歌曲 ID，用于加载时精确定位
     pub current_song_id: u64,
 }
@@ -43,6 +45,7 @@ impl Default for PlayListData {
             play_state: false,
             position: 0,
             play_position: 0,
+            sources: Default::default(),
             current_song_id: 0,
         }
     }
@@ -75,6 +78,7 @@ pub struct PlayList {
     position: usize,
     // 当前播放进度（微秒）
     play_position: u64,
+    pub sources: std::collections::HashMap<u64, ncm_api::PlaybackSource>,
 }
 
 impl Default for PlayList {
@@ -92,6 +96,7 @@ impl PlayList {
             play_state: false,
             position: 0,
             play_position: 0,
+            sources: Default::default(),
         }
     }
 
@@ -144,6 +149,7 @@ impl PlayList {
                         play_state: data.play_state,
                         position,
                         play_position: data.play_position,
+                        sources: data.sources,
                     };
                     if data.current_song_id > 0 {
                         playlist.sync_position_with_song_id(data.current_song_id);
@@ -171,6 +177,7 @@ impl PlayList {
             play_state: self.play_state,
             position: self.position,
             play_position: self.play_position,
+            sources: self.sources.clone(),
             current_song_id: self.current_song().map(|s| s.id).unwrap_or(0),
         };
         match serde_json::to_string_pretty(&data) {

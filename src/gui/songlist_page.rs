@@ -45,6 +45,12 @@ impl SonglistPage {
         let imp = self.imp();
         let sender = imp.sender.get().unwrap();
         imp.songlist.replace(Some(songlist.to_owned()));
+        let kind = if is_album { "album" } else { "list" };
+        imp.songs_list.set_source(ncm_api::PlaybackSource {
+            id: songlist.id.to_string(),
+            kind: kind.into(),
+            name: kind.into(),
+        });
 
         if is_album {
             imp.time_label.set_visible(true);
@@ -279,7 +285,11 @@ mod imp {
             let playlist = self.songs_list.get_songinfo_list();
             if !playlist.is_empty() {
                 sender
-                    .send_blocking(Action::AddPlayList(playlist, true))
+                    .send_blocking(Action::AddPlayList(
+                        playlist,
+                        true,
+                        self.songs_list.playback_source(),
+                    ))
                     .unwrap();
             } else {
                 sender

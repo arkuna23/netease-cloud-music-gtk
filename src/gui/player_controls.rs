@@ -33,6 +33,22 @@ use std::{
     thread,
 };
 
+use crate::audio::scrobble::{EndReason, PlaybackGate, PlaybackObservation};
+use std::time::{Duration, Instant};
+
+fn observe_playback(
+    sender: &Sender<Action>,
+    gate: &Mutex<PlaybackGate>,
+    observation: PlaybackObservation,
+) {
+    if let Some(generation) = gate.lock().unwrap().active() {
+        let _ = sender.try_send(Action::PlaybackObserved(
+            generation,
+            observation,
+            Instant::now(),
+        ));
+    }
+}
 glib::wrapper! {
     pub struct PlayerControls(ObjectSubclass<imp::PlayerControls>)
         @extends gtk::Widget, gtk::Box,
@@ -55,14 +71,12 @@ impl PlayerControls {
     fn setup_settings(&self) {
         let settings = Settings::new(crate::APP_ID);
 
-        self.imp()
-            .volume_button
-            .set_icons(&[
-                "audio-volume-muted-symbolic",
-                "audio-volume-high-symbolic",
-                "audio-volume-low-symbolic",
-                "audio-volume-medium-symbolic",
-            ]);
+        self.imp().volume_button.set_icons(&[
+            "audio-volume-muted-symbolic",
+            "audio-volume-high-symbolic",
+            "audio-volume-low-symbolic",
+            "audio-volume-medium-symbolic",
+        ]);
 
         self.imp()
             .settings
@@ -166,7 +180,22 @@ impl PlayerControls {
         imp.player_signal.set(player_signal).unwrap();
     }
 
-    pub fn play(&self, song_info: SongInfo) {
+    pub fn playback_position(&self) -> Option<Duration> {
+        self.imp()
+            .player
+            .get()?
+            .position()
+            .map(|p| Duration::from_micros(p.useconds()))
+    }
+
+    pub fn stop_for_quit(&self) {
+        self.imp().playback_gate.lock().unwrap().stop();
+        if let Some(player) = self.imp().player.get() {
+            player.stop();
+        }
+    }
+
+    pub fn play(&self, song_info: SongInfo, generation: u64) {
         let imp = self.imp();
 
         let sender = imp.sender.get().unwrap();
@@ -178,6 +207,10 @@ impl PlayerControls {
             .unwrap();
 
         let player = imp.player.get().unwrap();
+        imp.playback_gate
+            .lock()
+            .unwrap()
+            .request(generation, &song_info.song_url);
         player.stop();
         player.set_uri(Some(&song_info.song_url));
         player.set_volume(self.property("volume"));
@@ -282,14 +315,23 @@ impl PlayerControls {
             }
         });
 
+        let gate = imp.playback_gate.clone();
+        player_sig.connect_uri_loaded(move |_, uri| {
+            gate.lock().unwrap().loaded(uri);
+        });
+
         let sender = sender_.clone();
+        let gate = imp.playback_gate.clone();
         let old_msec: Cell<u64> = Cell::new(0);
         player_sig.connect_position_updated(move |_, clock| {
             if let Some(clock) = clock {
-                // mseconds -> milliseconds
-                // useconds -> microseconds
+                observe_playback(
+                    &sender,
+                    &gate,
+                    PlaybackObservation::Position(Duration::from_micros(clock.useconds())),
+                );
                 let msec = clock.mseconds();
-                if old_msec.get() / 500 != msec / 500 {
+                if gate.lock().unwrap().active().is_some() && old_msec.get() / 500 != msec / 500 {
                     sender
                         .send_blocking(Action::ScaleSeekUpdate(clock.useconds()))
                         .unwrap();
@@ -299,35 +341,109 @@ impl PlayerControls {
         });
 
         let sender = sender_.clone();
+        let gate = imp.playback_gate.clone();
         player_sig.connect_duration_changed(move |_, clock| {
             if let Some(clock) = clock {
+                observe_playback(
+                    &sender,
+                    &gate,
+                    PlaybackObservation::Duration(Duration::from_micros(clock.useconds())),
+                );
+                if gate.lock().unwrap().active().is_some() {
+                    sender
+                        .send_blocking(Action::GstDurationChanged(clock.useconds()))
+                        .unwrap();
+                }
+            }
+        });
+
+        let sender = sender_.clone();
+        let gate = imp.playback_gate.clone();
+        let eos_player = player.clone();
+        player_sig.connect_end_of_stream(move |_| {
+            if let Some(position) = eos_player.position() {
+                observe_playback(
+                    &sender,
+                    &gate,
+                    PlaybackObservation::Position(Duration::from_micros(position.useconds())),
+                );
+            }
+            gate.lock().unwrap().mark_stopped();
+            if let Some(generation) = gate.lock().unwrap().active() {
                 sender
-                    .send_blocking(Action::GstDurationChanged(clock.useconds()))
+                    .send_blocking(Action::PlaybackFinished(generation, EndReason::Eos))
                     .unwrap();
             }
         });
 
         let sender = sender_.clone();
-        player_sig.connect_end_of_stream(move |_| {
-            sender.send_blocking(Action::PlayNextSong).unwrap();
-        });
-
-        let sender = sender_.clone();
+        let gate = imp.playback_gate.clone();
         player_sig.connect_error(move |_, e, _| {
-            sender
-                .send_blocking(Action::AddToast(gettext_f(
-                    "Playback error:{err}",
-                    &[("err", &e.to_string())],
-                )))
-                .unwrap();
-            sender.send_blocking(Action::PlayNextSong).unwrap();
+            gate.lock().unwrap().mark_stopped();
+            if let Some(generation) = gate.lock().unwrap().active() {
+                sender
+                    .send_blocking(Action::AddToast(gettext_f(
+                        "Playback error:{err}",
+                        &[("err", &e.to_string())],
+                    )))
+                    .unwrap();
+                sender
+                    .send_blocking(Action::PlaybackFinished(generation, EndReason::Error))
+                    .unwrap();
+            }
         });
 
         let sender = sender_.clone();
+        let gate = imp.playback_gate.clone();
+        let state_player = player.clone();
         player_sig.connect_state_changed(move |_, state| {
-            sender
-                .send_blocking(Action::GstStateChanged(state))
-                .unwrap();
+            if state != PlayState::Playing {
+                if let Some(position) = state_player.position() {
+                    observe_playback(
+                        &sender,
+                        &gate,
+                        PlaybackObservation::Position(Duration::from_micros(position.useconds())),
+                    );
+                }
+            }
+            observe_playback(
+                &sender,
+                &gate,
+                PlaybackObservation::Playing(state == PlayState::Playing),
+            );
+            if state == PlayState::Stopped {
+                gate.lock().unwrap().mark_stopped();
+            }
+            if let Some(generation) = gate.lock().unwrap().active() {
+                sender
+                    .send_blocking(Action::GstStateChanged(state))
+                    .unwrap();
+                if state == PlayState::Stopped {
+                    sender
+                        .send_blocking(Action::PlaybackFinished(generation, EndReason::Stop))
+                        .unwrap();
+                }
+            }
+        });
+
+        let sender = sender_.clone();
+        let gate = imp.playback_gate.clone();
+        player_sig.connect_buffering(move |_, percent| {
+            observe_playback(
+                &sender,
+                &gate,
+                PlaybackObservation::Buffering(percent < 100),
+            );
+        });
+
+        let sender = sender_.clone();
+        let gate = imp.playback_gate.clone();
+        player_sig.connect_seek_done(move |_, position| {
+            observe_playback(
+                &sender,
+                &gate,
+                PlaybackObservation::SeekDone(Duration::from_micros(position.useconds())),
+            );
         });
 
         let sender = sender_.clone();
@@ -336,9 +452,6 @@ impl PlayerControls {
                 .send_blocking(Action::GstVolumeChanged(volume))
                 .unwrap();
         });
-
-        // let sender = sender_.clone();
-        // player_sig.connect_buffering(move |_, percent| {});
     }
 
     // msec -> microseconds
@@ -411,6 +524,11 @@ impl PlayerControls {
 
     // msec -> microseconds
     pub fn gst_position_update(&self, msec: u64) {
+        observe_playback(
+            self.imp().sender.get().unwrap(),
+            &self.imp().playback_gate,
+            PlaybackObservation::Seek,
+        );
         let imp = self.imp();
         let player = imp.player.get().unwrap();
         player.seek(ClockTime::from_useconds(msec));
@@ -560,8 +678,18 @@ impl PlayerControls {
         }
     }
 
-    pub fn add_song(&self, song: SongInfo) {
+    pub fn playback_source(&self, song_id: u64) -> ncm_api::PlaybackSource {
+        self.imp()
+            .playlist
+            .lock()
+            .ok()
+            .and_then(|p| p.sources.get(&song_id).cloned())
+            .unwrap_or_default()
+    }
+
+    pub fn add_song(&self, song: SongInfo, source: ncm_api::PlaybackSource) {
         if let Ok(mut playlist) = self.imp().playlist.lock() {
+            playlist.sources.insert(song.id, source);
             playlist.add_song(song);
         }
         // 用户选择了新歌曲，清除恢复时保存的播放进度
@@ -585,7 +713,7 @@ impl PlayerControls {
         }
     }
 
-    pub fn add_list(&self, list: Vec<SongInfo>) {
+    pub fn add_list(&self, list: Vec<SongInfo>, source: ncm_api::PlaybackSource) {
         let settings = self.settings();
         let not_ignore_grey = settings.get("not-ignore-grey");
         let list: Vec<SongInfo> = if not_ignore_grey {
@@ -597,6 +725,7 @@ impl PlayerControls {
         };
 
         if let Ok(mut playlist) = self.imp().playlist.lock() {
+            playlist.sources = list.iter().map(|song| (song.id, source.clone())).collect();
             playlist.add_list(list);
         }
         // 用户选择了新歌单，清除恢复时保存的播放进度
@@ -607,7 +736,10 @@ impl PlayerControls {
     // 心动模式开启/关闭时更新按钮状态（开启红心高亮）
     pub fn set_heartbeat_active(&self, active: bool) {
         if active {
-            self.imp().moved_button.get().add_css_class("heartbeat-active");
+            self.imp()
+                .moved_button
+                .get()
+                .add_css_class("heartbeat-active");
         } else {
             self.imp()
                 .moved_button
@@ -763,7 +895,7 @@ impl PlayerControls {
     // 返回 true 表示已处理恢复情况，调用方应直接返回
     pub fn try_play_restored_song(&self) -> bool {
         let imp = self.imp();
-        if imp.restored.replace(false) {
+        if imp.restored.replace(false) || imp.playback_gate.lock().unwrap().needs_reload() {
             if let Some(sender) = imp.sender.get() {
                 if let Ok(playlist) = imp.playlist.lock() {
                     if let Some(song_info) = playlist.current_song() {
@@ -1067,6 +1199,7 @@ mod imp {
 
         pub settings: OnceCell<Settings>,
         pub sender: OnceCell<Sender<Action>>,
+        pub playback_gate: Arc<Mutex<PlaybackGate>>,
         pub player: OnceCell<gstreamer_play::Play>,
         pub player_signal: OnceCell<gstreamer_play::PlaySignalAdapter>,
         pub playlist: Arc<Mutex<PlayList>>,
@@ -1182,7 +1315,11 @@ mod imp {
         fn next_button_clicked_cb(&self) {
             let sender = self.sender.get().unwrap().clone();
             let (loops, pos_before, len) = if let Ok(playlist) = self.playlist.lock() {
-                (playlist.get_loops(), playlist.get_position(), playlist.len())
+                (
+                    playlist.get_loops(),
+                    playlist.get_position(),
+                    playlist.len(),
+                )
             } else {
                 (LoopsState::None, 0, 0)
             };
@@ -1218,7 +1355,10 @@ mod imp {
                     if let Some(si) = playlist.current_song().map(|s| s.to_owned()) {
                         // 不循环模式播完：追加心动歌曲并自动续播
                         sender
-                            .send_blocking(Action::HeartbeatExtend(si, HeartbeatExtendMode::ListEnd))
+                            .send_blocking(Action::HeartbeatExtend(
+                                si,
+                                HeartbeatExtendMode::ListEnd,
+                            ))
                             .unwrap();
                         return;
                     }
@@ -1437,4 +1577,117 @@ fn load_css() {
         &provider,
         gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Action, EndReason, PlaybackObservation, PlayerControls};
+    use gstreamer as gst;
+    use gtk::{gio, glib, prelude::*, subclass::prelude::*};
+    use std::{
+        fs,
+        time::{Duration, Instant},
+    };
+
+    #[test]
+    #[ignore = "requires a display, built resources and GSETTINGS_SCHEMA_DIR"]
+    fn cached_playback_emits_measured_generation_events() {
+        gtk::init().unwrap();
+        gst::init().unwrap();
+        crate::path::init().unwrap();
+        let resource = gio::Resource::load(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("_build/data/netease-cloud-music-gtk4.gresource"),
+        )
+        .unwrap();
+        gio::resources_register(&resource);
+        let preferences = crate::gui::NeteaseCloudMusicGtk4Preferences::new();
+        let settings = gio::Settings::new(crate::APP_ID);
+        assert!(preferences.imp().sync_listening_history.get().is_active());
+        preferences
+            .imp()
+            .sync_listening_history
+            .get()
+            .set_active(false);
+        assert_eq!(
+            settings.boolean("sync-listening-history"),
+            preferences.imp().sync_listening_history.get().is_active()
+        );
+        settings
+            .set_boolean("sync-listening-history", true)
+            .unwrap();
+        assert!(preferences.imp().sync_listening_history.get().is_active());
+        let controls = PlayerControls::new();
+        let (sender, receiver) = async_channel::unbounded();
+        controls.set_sender(sender);
+        let player = controls.imp().player.get().unwrap().clone();
+        let sink = gst::ElementFactory::make("fakesink")
+            .property("sync", true)
+            .build()
+            .unwrap();
+        player.pipeline().set_property("audio-sink", &sink);
+        let path = std::env::temp_dir().join(format!("ncm-scrobble-{}.wav", std::process::id()));
+        let mut wav = Vec::new();
+        wav.extend(b"RIFF");
+        wav.extend(16036u32.to_le_bytes());
+        wav.extend(b"WAVEfmt ");
+        wav.extend(16u32.to_le_bytes());
+        wav.extend(1u16.to_le_bytes());
+        wav.extend(1u16.to_le_bytes());
+        wav.extend(8000u32.to_le_bytes());
+        wav.extend(16000u32.to_le_bytes());
+        wav.extend(2u16.to_le_bytes());
+        wav.extend(16u16.to_le_bytes());
+        wav.extend(b"data");
+        wav.extend(16000u32.to_le_bytes());
+        wav.resize(16044, 0);
+        fs::write(&path, wav).unwrap();
+        let mut song = crate::utils::empty_song_info();
+        song.id = 42;
+        song.name = "Playback fixture".into();
+        song.duration = 1000;
+        song.song_url = gio::File::for_path(&path).uri().to_string();
+        controls.add_song(song.clone(), Default::default());
+        controls.play(song, 9);
+        let context = glib::MainContext::default();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut positions = Vec::new();
+        let mut playing = false;
+        let mut completed = false;
+        while Instant::now() < deadline && !completed {
+            while context.pending() {
+                context.iteration(false);
+            }
+            while let Ok(action) = receiver.try_recv() {
+                match action {
+                    Action::PlaybackObserved(9, PlaybackObservation::Position(position), _) => {
+                        positions.push(position)
+                    }
+                    Action::PlaybackObserved(9, PlaybackObservation::Playing(true), _) => {
+                        playing = true
+                    }
+                    Action::PlaybackFinished(9, EndReason::Eos) => completed = true,
+                    _ => (),
+                }
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        controls.switch_play();
+        let mut replay_requested = false;
+        while let Ok(action) = receiver.try_recv() {
+            if matches!(action, Action::Play(song) if song.id == 42) {
+                replay_requested = true;
+            }
+        }
+        assert!(replay_requested);
+        controls.stop_for_quit();
+        fs::remove_file(path).unwrap();
+        assert!(playing);
+        assert!(completed);
+        assert!(
+            positions
+                .iter()
+                .any(|position| *position >= Duration::from_millis(500))
+        );
+    }
 }

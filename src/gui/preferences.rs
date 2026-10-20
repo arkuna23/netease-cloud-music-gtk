@@ -6,7 +6,7 @@
 
 use gio::Settings;
 use gtk::gio::SettingsBindFlags;
-use gtk::{glib, prelude::*, subclass::prelude::*, CompositeTemplate, *};
+use gtk::{CompositeTemplate, glib, prelude::*, subclass::prelude::*, *};
 use once_cell::sync::OnceCell;
 
 glib::wrapper! {
@@ -74,6 +74,14 @@ impl NeteaseCloudMusicGtk4Preferences {
             .bind("desktop-lyrics", &desktop_lyrics, "active")
             .flags(SettingsBindFlags::DEFAULT)
             .build();
+        self.settings()
+            .bind(
+                "sync-listening-history",
+                &self.imp().sync_listening_history.get(),
+                "active",
+            )
+            .flags(SettingsBindFlags::DEFAULT)
+            .build();
     }
 
     pub fn set_cache_size_label(&self, size: f64, unit: String) {
@@ -114,6 +122,8 @@ mod imp {
         pub cache_clear: TemplateChild<adw::ComboRow>,
         #[template_child]
         pub desktop_lyrics: TemplateChild<Switch>,
+        #[template_child]
+        pub sync_listening_history: TemplateChild<Switch>,
     }
 
     #[glib::object_subclass]

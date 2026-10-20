@@ -6,13 +6,13 @@
 use gio::Settings;
 use gtk::prelude::*;
 use gtk::subclass::prelude::*;
-use gtk::{glib, CompositeTemplate, *};
+use gtk::{CompositeTemplate, glib, *};
 
 use crate::{application::Action, gui::songlist_row::SonglistRow};
 use async_channel::Sender;
 use glib::{
-    clone, subclass::Signal, ParamSpec, ParamSpecBoolean, ParamSpecInt, RustClosure,
-    SignalHandlerId, Value,
+    ParamSpec, ParamSpecBoolean, ParamSpecInt, RustClosure, SignalHandlerId, Value, clone,
+    subclass::Signal,
 };
 use ncm_api::SongInfo;
 use once_cell::sync::{Lazy, OnceCell};
@@ -54,6 +54,14 @@ impl SongListView {
             .expect("Could not set `Settings`.");
     }
 
+    pub fn set_source(&self, source: ncm_api::PlaybackSource) {
+        self.imp().source.replace(source);
+    }
+
+    pub fn playback_source(&self) -> ncm_api::PlaybackSource {
+        self.imp().source.borrow().clone()
+    }
+
     pub fn init_new_list(&self, sis: &[SongInfo], likes: &[bool]) {
         let imp = self.imp();
         let sender = imp.sender.get().unwrap().to_owned();
@@ -79,7 +87,9 @@ impl SongListView {
                 move |row| {
                     if row.is_activatable() || row.not_ignore_grey() {
                         row.switch_image(true);
-                        sender.send_blocking(Action::AddPlay(si.clone())).unwrap();
+                        sender
+                            .send_blocking(Action::AddPlay(si.clone(), s.playback_source()))
+                            .unwrap();
                         s.emit_row_activated(row);
                     }
                 }
@@ -165,6 +175,7 @@ mod imp {
 
         pub sender: OnceCell<Sender<Action>>,
         pub settings: OnceCell<Settings>,
+        pub source: RefCell<ncm_api::PlaybackSource>,
 
         no_act_like: Cell<bool>,
         no_act_album: Cell<bool>,
@@ -217,9 +228,11 @@ mod imp {
 
         fn signals() -> &'static [Signal] {
             static SIGNALS: Lazy<Vec<Signal>> = Lazy::new(|| {
-                vec![Signal::builder("row-activated")
-                    .param_types([SonglistRow::static_type()])
-                    .build()]
+                vec![
+                    Signal::builder("row-activated")
+                        .param_types([SonglistRow::static_type()])
+                        .build(),
+                ]
             });
             SIGNALS.as_ref()
         }

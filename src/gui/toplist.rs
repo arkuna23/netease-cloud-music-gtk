@@ -174,7 +174,11 @@ mod imp {
             if !self.playlist.borrow().is_empty() {
                 let playlist = &*self.playlist.borrow();
                 sender
-                    .send_blocking(Action::AddPlayList(playlist.clone(), true))
+                    .send_blocking(Action::AddPlayList(
+                        playlist.clone(),
+                        true,
+                        self.songs_list.playback_source(),
+                    ))
                     .unwrap();
             } else {
                 sender
@@ -190,6 +194,11 @@ mod imp {
 
             let data = self.data.get().unwrap();
             if let Some(info) = data.get(index as usize) {
+                songs_list.set_source(ncm_api::PlaybackSource {
+                    id: info.id.to_string(),
+                    kind: "list".into(),
+                    name: "list".into(),
+                });
                 self.sender
                     .get()
                     .unwrap()

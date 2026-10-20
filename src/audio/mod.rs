@@ -6,6 +6,7 @@
 
 mod mpris;
 mod playlist;
+pub mod scrobble;
 
 pub use mpris::*;
 pub use playlist::*;

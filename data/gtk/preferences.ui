@@ -85,6 +85,18 @@
                     <object class="AdwPreferencesGroup">
                         <property name="title" translatable="yes">Music</property>
                         <child>
+                            <object class="AdwActionRow">
+                                <property name="title" translatable="yes">Sync listening history</property>
+                                <property name="subtitle" translatable="yes">Sync actual playback to your signed-in Netease account</property>
+                                <property name="activatable-widget">sync_listening_history</property>
+                                <child>
+                                    <object class="GtkSwitch" id="sync_listening_history">
+                                        <property name="valign">center</property>
+                                    </object>
+                                </child>
+                            </object>
+                        </child>
+                        <child>
                             <object class="AdwComboRow" id="switch_rate">
                                 <property name="title" translatable="yes">Sound quality</property>
                                 <property name="model">

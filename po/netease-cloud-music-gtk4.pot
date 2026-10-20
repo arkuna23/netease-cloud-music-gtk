@@ -587,3 +587,11 @@ msgstr ""
 #: src/gui/songlist_page.rs
 msgid "Switch to newest first"
 msgstr ""
+
+#: data/gtk/preferences.ui data/com.gitee.gmg137.NeteaseCloudMusicGtk4.gschema.xml
+msgid "Sync listening history"
+msgstr ""
+
+#: data/gtk/preferences.ui
+msgid "Sync actual playback to your signed-in Netease account"
+msgstr ""

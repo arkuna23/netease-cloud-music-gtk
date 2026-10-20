@@ -52,6 +52,10 @@
             <default>false</default>
             <summary>Always try to play grey song</summary>
         </key>
+        <key name="sync-listening-history" type="b">
+            <default>true</default>
+            <summary>Sync listening history</summary>
+        </key>
         <key name="desktop-lyrics" type="b">
             <default>false</default>
             <summary>Desktop Lyrics</summary>
