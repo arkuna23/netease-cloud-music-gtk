@@ -33,4 +33,7 @@ features = ["v1_6"]
 
 [package.metadata.bundle]
 icon = ["data/icons/hicolor/512x512@2x.png"]
-osx_minimum_system_version = "11.0"
+
+# cargo-bundle >= 0.12 reads this as LSMinimumSystemVersion (table alias: macos).
+[package.metadata.bundle.osx]
+minimum_system_version = "11.0"
